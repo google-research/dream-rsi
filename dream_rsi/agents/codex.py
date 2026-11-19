@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import shlex
@@ -25,7 +24,14 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from dream_rsi.agents.base import AgentResult, save_prompt, save_run_logs
+from dream_rsi.agents.base import (
+    AgentResult,
+    kill_proc_group,
+    register_proc,
+    save_prompt,
+    save_run_logs,
+    unregister_proc,
+)
 
 _verified_codex: set[str] = set()
 
@@ -113,30 +119,36 @@ class CodexAgent:
         except (FileNotFoundError, RuntimeError) as exc:
             return AgentResult(status="failed", message=str(exc))
 
-        async def _run() -> subprocess.CompletedProcess:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
                 cwd=str(cwd),
                 env=os.environ.copy(),
+                start_new_session=True,
             )
-            stdout, _ = await proc.communicate()
-            return subprocess.CompletedProcess(cmd, proc.returncode or 0, stdout.decode("utf-8", errors="replace"))
-
-        try:
-            if self.timeout_sec:
-                cp = asyncio.run(asyncio.wait_for(_run(), timeout=self.timeout_sec))
-            else:
-                cp = asyncio.run(_run())
-        except asyncio.TimeoutError:
-            return AgentResult(status="failed", message=f"codex timeout after {self.timeout_sec}s")
-        except Exception as exc:
+        except OSError as exc:
             return AgentResult(status="failed", message=str(exc))
 
-        save_run_logs(log_dir, stdout=cp.stdout or "", command=cmd)
-        if cp.returncode != 0:
-            return AgentResult(status="failed", message=f"codex exit {cp.returncode}")
+        # Own process group + registration, like every other agent/evaluator
+        # subprocess, so a timeout or shutdown_agents() actually kills `codex`
+        # instead of leaving it running in the background.
+        register_proc(proc)
+        try:
+            try:
+                stdout, _ = proc.communicate(timeout=self.timeout_sec)
+            except subprocess.TimeoutExpired:
+                kill_proc_group(proc)
+                proc.communicate()
+                return AgentResult(status="failed", message=f"codex timeout after {self.timeout_sec}s")
+        finally:
+            unregister_proc(proc)
+
+        save_run_logs(log_dir, stdout=stdout or "", command=cmd)
+        if proc.returncode != 0:
+            return AgentResult(status="failed", message=f"codex exit {proc.returncode}")
 
         return AgentResult(message="codex finished")
 
